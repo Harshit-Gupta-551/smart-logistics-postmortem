@@ -1,0 +1,18 @@
+# Ignore all virtual environments
+**/venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+
+# Logs and exported data
+*.log
+logs_sample.csv
+
+# VS Code settings
+.vscode/
