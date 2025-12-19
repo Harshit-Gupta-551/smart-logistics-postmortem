@@ -1,33 +1,46 @@
-import pandas as pd
-from pathlib import Path
+import os
 import re
+from pathlib import Path
+from typing import List, Dict, Any
 
-# CSV in this folder
+import pandas as pd
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# ------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------
 LOG_FILE = Path("logs_sample.csv")
-
-# Regex to extract order IDs like:
-# - ORD-20251218150457
-# - ORD-PROC-20251218150606
 ORDER_ID_REGEX = re.compile(r"(ORD-(?:PROC-)?\d+)")
 
+# Load environment with Gemini key
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-def extract_order_id(message: str) -> str | None:
-    """Extract order id from log message, if present."""
+if not GEMINI_API_KEY:
+    print("[WARN] GEMINI_API_KEY not set. LLM-based reports will be skipped.")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+
+# ------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------
+def extract_order_id(message: str):
     if not isinstance(message, str):
         return None
-    match = ORDER_ID_REGEX.search(message)
-    return match.group(1) if match else None
+    m = ORDER_ID_REGEX.search(message)
+    return m.group(1) if m else None
 
 
 def load_logs() -> pd.DataFrame | None:
-    """Load CSV exported from Application Insights."""
     if not LOG_FILE.exists():
         print(f"[ERROR] Log file not found: {LOG_FILE.resolve()}")
         return None
 
     df = pd.read_csv(LOG_FILE)
 
-    # Normalize columns
     if "timestamp [UTC]" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp [UTC]"])
     else:
@@ -36,11 +49,8 @@ def load_logs() -> pd.DataFrame | None:
 
     df["message"] = df["message"].astype(str)
     df["severityLevel"] = df["severityLevel"].fillna(0).astype(int)
-
-    # Extract order_id from message
     df["order_id"] = df["message"].apply(extract_order_id)
 
-    # Sort by time
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     print(f"Loaded {len(df)} rows from {LOG_FILE.name}")
@@ -48,17 +58,13 @@ def load_logs() -> pd.DataFrame | None:
     return df
 
 
-def build_incidents(df: pd.DataFrame) -> list[dict]:
-    """
-    Group logs by order_id and build simple incident summaries.
-    We treat any order_id that has an ERROR (severityLevel >= 3) as an incident.
-    """
+def build_incidents(df: pd.DataFrame) -> List[Dict[str, Any]]:
     df_orders = df[df["order_id"].notna()].copy()
     if df_orders.empty:
         print("No rows with order_id found in logs.")
         return []
 
-    incidents: list[dict] = []
+    incidents: List[Dict[str, Any]] = []
 
     for order_id, group in df_orders.groupby("order_id"):
         group = group.sort_values("timestamp")
@@ -70,7 +76,6 @@ def build_incidents(df: pd.DataFrame) -> list[dict]:
         end_time = group["timestamp"].max()
         duration = (end_time - start_time).total_seconds()
 
-        # Get last ERROR message as main failure reason (if any)
         error_rows = group[group["severityLevel"] >= 3]
         failure_detail = None
         if not error_rows.empty:
@@ -94,8 +99,7 @@ def build_incidents(df: pd.DataFrame) -> list[dict]:
     return incidents
 
 
-def print_incidents(incidents: list[dict]) -> None:
-    """Pretty-print incident summaries to console."""
+def print_incidents(incidents: List[Dict[str, Any]]) -> None:
     if not incidents:
         print("No incidents detected.")
         return
@@ -121,74 +125,52 @@ def print_incidents(incidents: list[dict]) -> None:
     print("End of incident summaries.")
 
 
-def classify_root_cause(failure_detail: str | None) -> str:
-    """Very simple rule-based root cause classification."""
-    if not failure_detail:
-        return "Unknown cause"
+def generate_postmortem_gemini(inc: Dict[str, Any]) -> str:
+    """
+    Use Google Gemini to generate a rich post-mortem.
+    """
+    if not GEMINI_API_KEY:
+        return "[LLM DISABLED] GEMINI_API_KEY not configured."
 
-    text = failure_detail.lower()
-    if "inventory service unavailable" in text:
-        return "Inventory service outage (dependency failure)"
-    if "insufficient stock" in text:
-        return "Inventory capacity / stock issue"
-    if "courier service timeout" in text or "courier api timeout" in text:
-        return "Courier API latency / timeout (third-party degradation)"
-    return "Unknown / unclassified failure"
+    import json
 
+    incident_json = json.dumps(
+        {
+            "order_id": inc["order_id"],
+            "status": inc["status"],
+            "start_time": str(inc["start_time"]),
+            "end_time": str(inc["end_time"]),
+            "duration_seconds": inc["duration_seconds"],
+            "failure_detail": inc["failure_detail"],
+            "timeline": inc["messages"],
+        },
+        indent=2,
+    )
 
-def generate_postmortem(inc: dict) -> str:
-    """Generate a simple text post-mortem for one incident."""
-    order_id = inc["order_id"]
-    status = inc["status"]
-    start = inc["start_time"]
-    end = inc["end_time"]
-    duration = inc["duration_seconds"]
-    failure_detail = inc["failure_detail"]
-    root_cause = classify_root_cause(failure_detail)
+    prompt = f"""
+You are a senior SRE/DevOps engineer helping write incident post-mortem reports
+for a smart logistics platform running on Microsoft Azure.
 
-    # Build a simple narrative from the timeline
-    timeline_lines = "\n".join(f"    - {m}" for m in inc["messages"])
+Here is the structured incident data:
 
-    if status == "FAILED":
-        outcome_text = f"The order *did not* complete successfully. Final status: {status}."
-    else:
-        outcome_text = f"The order completed successfully. Final status: {status}."
+{incident_json}
 
-    summary = f"""
-POST-MORTEM REPORT (Order: {order_id})
+Generate a detailed post-mortem with these sections:
 
-1. Summary
-   - Impacted entity: Single order in demo environment
-   - Time window: {start} → {end} (≈ {duration:.1f} seconds)
-   - Outcome: {outcome_text}
-   - Primary failure detail: {failure_detail or "N/A"}
-   - Classified root cause: {root_cause}
+1. Executive Summary (2–4 sentences, non-technical, for managers)
+2. Impact
+3. Technical Root Cause
+4. Timeline of Events (bulleted, chronological)
+5. Contributing Factors
+6. Corrective and Preventive Actions (3–6 concrete items, each with priority P0/P1/P2)
+7. Lessons Learned (3 key points)
 
-2. Timeline of Events
-{timeline_lines}
-
-3. Technical Root Cause (Initial)
-   - {root_cause}
-   - Evidence:
-     - {failure_detail or "No explicit error message in logs"}
-
-4. Possible Preventive Actions (Suggestions)
-   - For inventory-related failures:
-     - Add monitoring on inventory service availability and stock thresholds.
-     - Implement fallback logic (e.g., retry, alternate warehouse) before failing orders.
-   - For courier/API timeouts:
-     - Implement exponential backoff and retries for courier API calls.
-     - Add timeout and circuit breaker patterns to avoid cascading failures.
-   - General:
-     - Include more structured context in logs (order value, region, user segment).
-     - Add synthetic tests for critical flows (order → inventory → courier).
-
-5. Notes
-   - This report is auto-generated from Application Insights traces.
-   - In a real system, multiple orders with similar patterns would be grouped into a higher-level incident.
+Keep it focused on this single incident.
 """.strip()
 
-    return summary
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    resp = model.generate_content(prompt)
+    return resp.text
 
 
 def main():
@@ -197,21 +179,22 @@ def main():
         return
 
     incidents = build_incidents(df)
-
-    # 1) Print compact incident summaries (what you already saw)
     print_incidents(incidents)
 
-    # 2) Generate post-mortem drafts for FAILED incidents
     failed = [inc for inc in incidents if inc["status"] == "FAILED"]
-
     if not failed:
-        print("\nNo failed incidents found; no post-mortems to generate.")
+        print("\nNo failed incidents found; no LLM post-mortems to generate.")
         return
 
-    print("\n\n=== AUTO-GENERATED POST-MORTEM DRAFTS FOR FAILED INCIDENTS ===\n")
+    print("\n\n=== GEMINI-GENERATED POST-MORTEM REPORTS FOR FAILED INCIDENTS ===\n")
 
-    for inc in failed:
-        report = generate_postmortem(inc)
+    for inc in failed[:3]:  # limit calls
+        print(f"### Post-mortem for {inc['order_id']}\n")
+        try:
+            report = generate_postmortem_gemini(inc)
+        except Exception as e:
+            print(f"[ERROR] Gemini generation failed: {e}")
+            break
         print(report)
         print("\n" + "-" * 80 + "\n")
 
