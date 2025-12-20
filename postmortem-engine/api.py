@@ -2,6 +2,7 @@ from typing import List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 
 from engine import (
     load_logs,
@@ -15,6 +16,18 @@ app = FastAPI(
     description="AI-assisted incident and post-mortem service for Smart Logistics",
     version="1.0.0",
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",  
+        "http://localhost:3000",  
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _load_incident_data() -> List[Dict[str, Any]]:
@@ -23,6 +36,17 @@ def _load_incident_data() -> List[Dict[str, Any]]:
         raise HTTPException(status_code=500, detail="Log file not found or unreadable")
     return build_incidents(df)
 
+@app.get("/")
+def root():
+    return {
+        "service": "postmortem-engine",
+        "status": "ok",
+        "endpoints": [
+            "/incidents",
+            "/incidents/{order_id}",
+            "/incidents/{order_id}/postmortem"
+        ],
+    }
 
 @app.get("/incidents")
 def list_incidents():
